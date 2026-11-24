@@ -1,5 +1,16 @@
 ## Changelog:
 
+#### 1.26.09
+- Somfy RTS: receive frames (command Ye1), reported as Ys...
+- Somfy RTS: fix inter-frame gap when sending
+- Somfy RTS: more robust receiver (spike filter, pulse level from the
+  position in the frame, pulse length from the sum of adjacent high and low
+  pulses (cancels the demodulator distortion), tolerates short dropouts,
+  frame start only after the hardware sync, address/rolling code check,
+  102kHz RX bandwidth, 12dB OOK decision boundary), diagnostics with X25
+  (Yd/Yp/Yh/Yc)
+- CUL-HM-CFG: use rf_mode_task() in main loop
+
 #### 1.26.08
 - MapleCUN: Fix serial2net
 

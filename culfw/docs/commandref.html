@@ -1024,6 +1024,37 @@
 		    RRRR - Rolling code<br>
 		    AAAAAA - Address (= remote channel)
 	     </ul>
+      <li>e&lt;0|1&gt;<br>
+        Enable (1) or disable (0) the reception of Somfy RTS frames. Without
+        argument the current state is reported (Ye:0 / Ye:1).<br>
+        In this mode the transceiver is tuned to 433.42 MHz, SlowRF reception
+        is replaced by Somfy RTS reception. Received frames are reported in the
+        same format as the answer of the s command:
+        YsKKCSRRRRAAAAAA (address bytes in air order, i.e. reversed),
+        followed by the RSSI value if bit 5 of the X command is set.
+        Repeated frames of a pressed button are only reported once, unless
+        bit 1 of the X command is set. Ye0 (or Yx) returns to the previous mode.
+        Only frames with a valid checksum, an address other than 000000/FFFFFF
+        and a rolling code other than 0 are reported.<br>
+        The receiver uses 102kHz bandwidth and a 12dB OOK decision boundary
+        (as ESPSomfy-RTS). For comparison this can be changed at runtime,
+        e.g. Cw1055 (325kHz bandwidth), Cw1D90 (4dB decision boundary),
+        Cw1BC7 (reduced gain); Ye1 restores the defaults.
+        Diagnostics: if bit 2 of the X command is set (e.g. X25), aborted
+        frames are reported as Yd&lt;bits&gt; &lt;H|L&gt; &lt;us&gt; &lt;half&gt;
+        (number of decoded bits, level and length of the offending pulse,
+        mean length of a half symbol in us), followed by
+        Yp&lt;hex&gt; lines (the pulses since the software sync, starting with
+        high, in units of 16us, 32 per line; only if the firmware is built with
+        e.g. SOMFY_RTS_RX_CAPTURE 128 defined in board.h, RAM: 1 byte per
+        pulse). With SOMFY_RTS_RX_CAPTURE a
+        software sync without at least 2 hardware sync pulses before it is
+        reported as Yh&lt;hw sync pulses&gt; &lt;H|L&gt; &lt;us&gt; 0, followed by
+        a Yp line with the 8 pulses before it. Frames with a checksum error
+        are reported as Yc&lt;frame&gt; (also for an invalid address or rolling code).<br>
+        Reception is not available on CUL_V4 (RAM) and in 868MHz firmware.
+      <li>x<br>
+        Leave the Somfy RTS mode and restore the previous configuration.
       </ul>
     </ul><br><br>
 

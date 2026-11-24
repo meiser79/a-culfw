@@ -61,6 +61,7 @@
 #define HAS_UNIROLL             // PROGMEM:   92
 #define HAS_MEMFN               // PROGMEM:  168
 #define HAS_SOMFY_RTS           // PROGMEM: 1716
+//#define SOMFY_RTS_RX_CAPTURE 128  // Somfy RX diagnostics (Yp/Yh), RAM: 137b
 #define HAS_CC1101_RX_PLL_LOCK_CHECK_TASK_WAIT  // PROGMEM: 118b
 #define HAS_CC1101_PLL_LOCK_CHECK_MSG           // PROGMEM:  22b
 #define HAS_CC1101_PLL_LOCK_CHECK_MSG_SW        // PROGMEM:  22b

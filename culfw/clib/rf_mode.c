@@ -101,6 +101,10 @@ void set_RF_mode(RF_mode_t mode) {
   uint8_t instance = CC1101.instance;
 #endif
 
+#ifdef HAS_SOMFY_RTS_RX
+  somfy_rts_rx_off();
+#endif
+
   switch(mode) {
     case RF_mode_slow:
       set_txrestore();
@@ -137,7 +141,11 @@ void set_RF_mode(RF_mode_t mode) {
 #endif
 #ifdef HAS_SOMFY_RTS
     case RF_mode_somfy:
+#ifdef HAS_SOMFY_RTS_RX
+      somfy_rts_rx_start();
+#else
       somfy_rts_tunein();
+#endif
       break;
 #endif
 #ifdef HAS_INTERTECHNO
@@ -267,6 +275,10 @@ void rf_mode_task(void) {
         #endif
         #ifdef HAS_SOMFY_RTS
         case RF_mode_somfy:
+          #ifdef HAS_SOMFY_RTS_RX
+          somfy_rts_task();
+          #endif
+          break;
         #endif
         #ifdef HAS_INTERTECHNO
         case RF_mode_intertechno:

@@ -46,9 +46,15 @@
 #include "fncollection.h"               // for EE_CC1100_CFG_SIZE, erb, etc
 #include "led.h"                        // for LED_OFF, LED_ON, SET_BIT
 #include "rf_receive.h"                 // for set_txrestore, tx_report
+#include "ttydata.h"                    // for TTY_Tx_Buffer
 #include "somfy_rts.h"
 #include "rf_mode.h"
 #include "multi_CC.h"
+#include "clock.h"                      // for ticks
+
+#ifdef USE_HAL
+#include "hal.h"
+#endif
 
 #ifndef USE_RF_MODE
 
@@ -60,7 +66,6 @@
 #include "rf_moritz.h"                  // for rf_moritz_init, moritz_on
 #endif
 
-static uint8_t somfy_rts_on = 0;
 #endif
 typedef uint8_t somfy_rts_frame_t;
 
@@ -82,7 +87,7 @@ const PROGMEM const uint8_t CC1100_SOMFY_RTS_CFG[EE_CC1100_CFG_SIZE] = {
 	0x10,// 0D FREQ2    *1E    21    433.42 (10,AB,85: Somfy RTS Frequency)
 	0xAB,// 0E FREQ1    *C4    65
 	0xA5,// 0F FREQ0    *EC    e8
-	0x55,// 10 MDMCFG4  *8C    55    bWidth 325kHz
+	0xC5,// 10 MDMCFG4  *8C    55    bWidth 102kHz (RX, was 0x55: 325kHz)
 	0x0A,// 11 MDMCFG3  *22   *43    Drate: 828 ((256+11)*2^5)*26000000/2^28
 	0x30,// 12 MDMCFG2  *02   *B0    Modulation: ASK
 	0x23,// 13 MDMCFG1  *22    23
@@ -93,9 +98,11 @@ const PROGMEM const uint8_t CC1100_SOMFY_RTS_CFG[EE_CC1100_CFG_SIZE] = {
 	0x18,// 18 MCSM0    *04    18    Calibration: RX/TX->IDLE
 	0x14,// 19 FOCCFG   *36    14
 	0x6C,// 1A BSCFG     6C    6C
-	0x07,// 1B AGCCTRL2 *03   *03    42 dB instead of 33dB
+	0x07,// 1B AGCCTRL2 *03   *03    42 dB (0xC7, reduced gain: no reception
+	     //                          below ca. -80dBm)
 	0x00,// 1C AGCCTRL1 *40   *40
-	0x90,// 1D AGCCTRL0 *91   *92    4dB decision boundery
+	0xB2,// 1D AGCCTRL0 *91   *92    12dB OOK decision boundary, AGC wait 32
+	     //                          samples (RX; 0x90: 4dB lost hw sync pulses)
 	0x87,// 1E WOREVT1   87    87
 	0x6B,// 1F WOREVT0   6B    6B
 	0xF8,// 20 WORCTRL   F8    F8
@@ -117,6 +124,97 @@ uint8_t somfy_restore_moritz = 0;
 uint8_t somfy_rts_repetition = 6;
 uint16_t somfy_rts_interval = 1240; // symbol width in us -> ca. 828 Hz data rate
 uint16_t somfy_rts_interval_half = 620;
+
+#ifdef HAS_SOMFY_RTS_RX
+/*
+ * Somfy RTS receiver
+ *
+ * The CC1101 is tuned to 433.42 MHz (ASK, asynchronous serial mode) and every
+ * edge on GDO2 is fed by the edge ISR (rf_receive.c) into somfy_rts_edge()
+ * together with the duration of the level that just ended.
+ *
+ * Frame on air (symbol width ca. 1280us):
+ *   wakeup (only first frame) | n x hw sync 2560us high/low |
+ *   sw sync 4850us high + 640us low | 56 bit manchester (0 = high->low,
+ *   1 = low->high), MSB first | inter-frame gap ca. 30ms low
+ *
+ * The decoded frame is "decrypted", the checksum is verified and the frame is
+ * reported in the same format as the echo of the Ys command:
+ *   Ys<key><ctrl+cks><rolling code><address a2 a1 a0>[<rssi>]
+ */
+
+#define SOMFY_RX_SYNC_MIN   3400        // us, software sync (nominal 4550-4850us,
+                                        // received: 4326-4387us)
+#define SOMFY_RX_SYNC_MAX   5900
+#define SOMFY_RX_FLUSH_US   3000        // no edge for this long: frame ended
+#define SOMFY_RX_YP_LINE    32          // pulses per Yp line
+#define SOMFY_RX_HIST       8           // pulses before a rejected sw sync (Yh)
+#define SOMFY_RX_HWSYNC_MIN 900         // hardware sync pulse (nominal 2416-2560us,
+#define SOMFY_RX_HWSYNC_MAX 4300        // received: high 1328-1520, low 3072-3600us)
+#define SOMFY_RX_HWSYNC_GAP 10000       // longer pulses end the hw sync
+#define SOMFY_RX_HWSYNC_CNT 2           // min. hw sync pulses before the sw sync
+                                        // (first frame: 2 x high/low = 4, but
+                                        // dropouts were seen there, too)
+
+#define SOMFY_RX_IDLE       0
+#define SOMFY_RX_SYNC       1
+#define SOMFY_RX_DATA       2
+
+#define SOMFY_RX_HALF_NONE  0
+#define SOMFY_RX_HALF_LOW   1
+#define SOMFY_RX_HALF_HIGH  2
+
+#define SOMFY_RX_BITS       (SOMFY_RTS_FRAME_SIZE*8)
+
+typedef struct {
+  uint8_t state;
+  uint8_t bits;                         // number of decoded bits
+  uint8_t half;                         // pending first half of a bit
+  uint8_t data[SOMFY_RTS_FRAME_SIZE];   // raw ("encrypted") frame
+  // mean length of a half symbol, tracked during the frame
+  uint16_t hlen;
+  uint8_t plevel;                       // level of the next data pulse
+  uint16_t dprev;                       // length of the previous data pulse
+  uint8_t nprev;                        // its number of half symbols
+  uint8_t hwsync;                       // consecutive hardware sync pulses
+  // glitch filter: the last pulse is held back until the next one has ended
+  uint8_t hold_valid, hold_level, glitch;
+  uint16_t hold_dur, glitch_dur;
+  uint8_t last_pin;                     // pin level after the previous edge
+#if SOMFY_RTS_RX_CAPTURE > 0
+  uint8_t hist[SOMFY_RX_HIST];          // last pulses outside of a frame
+  uint8_t hist_pos;
+#endif
+} somfy_rx_t;
+
+// diagnostics (X command bit 2, e.g. X25): why a frame was aborted
+typedef struct {
+  volatile uint8_t ready;
+  uint8_t kind;                         // 'd': aborted, 'h': sw sync rejected
+  uint8_t bits, level;
+  uint16_t raw;                         // pulse length as measured
+  uint16_t hlen;                        // mean half symbol length
+#if SOMFY_RTS_RX_CAPTURE > 0
+  uint8_t n;                            // number of captured pulses
+  uint8_t pos;                          // next pulse to report
+  uint8_t pulse[SOMFY_RTS_RX_CAPTURE];  // pulses since the sw sync, 16us units
+#endif
+} somfy_rx_dbg_t;
+
+extern void reset_input(void);          // rf_receive.c
+
+static volatile uint8_t somfy_rx_on[NUM_SLOWRF];
+static somfy_rx_t somfy_rx[NUM_SLOWRF];
+static somfy_rx_dbg_t somfy_rx_dbg[NUM_SLOWRF];
+static volatile uint8_t somfy_rx_ready[NUM_SLOWRF];
+static uint8_t somfy_rx_frame[NUM_SLOWRF][SOMFY_RTS_FRAME_SIZE];
+static uint8_t somfy_rx_last[NUM_SLOWRF][SOMFY_RTS_FRAME_SIZE];
+static uint32_t somfy_rx_time[NUM_SLOWRF];
+
+#define SOMFY_RX_ON (CC_INSTANCE < NUM_SLOWRF && somfy_rx_on[CC_INSTANCE])
+#else
+#define SOMFY_RX_ON 0
+#endif
 
 void somfy_rts_tunein(void) {
 #ifdef USE_HAL
@@ -164,6 +262,384 @@ void somfy_rts_tunein(void) {
 #endif
     checkFrequency(); 
 }
+
+#ifdef HAS_SOMFY_RTS_RX
+uint8_t somfy_rts_rx_active(void) {
+  return SOMFY_RX_ON;
+}
+
+void somfy_rts_rx_off(void) {
+  if (SOMFY_RX_ON) {
+    somfy_rx_on[CC_INSTANCE] = 0;
+    reset_input();                      // hand the timer back to SlowRF
+  }
+}
+
+// Stop decoding without touching the timer (used while sending)
+static void somfy_rts_rx_pause(void) {
+  if (CC_INSTANCE < NUM_SLOWRF)
+    somfy_rx_on[CC_INSTANCE] = 0;
+}
+
+void somfy_rts_rx_start(void) {
+  somfy_rts_tunein();                   // disables the edge interrupt
+
+  if (!(CC_INSTANCE < NUM_SLOWRF))      // no edge interrupt / timer available
+    return;
+
+  reset_input();                        // abort a pending SlowRF reception
+  memset(&somfy_rx[CC_INSTANCE], 0, sizeof(somfy_rx_t));
+  somfy_rx_dbg[CC_INSTANCE].ready = 0;
+  somfy_rx_ready[CC_INSTANCE] = 0;
+
+  // let the timer run freely, the edge ISR measures the pulse widths
+#ifdef USE_HAL
+  hal_enable_CC_timer_int(CC_INSTANCE, FALSE);
+  HAL_timer_set_reload_register(CC_INSTANCE, 0xFFFF);
+  HAL_timer_reset_counter_value(CC_INSTANCE);
+#else
+  TIMSK1 = 0;
+  OCR1A = 0xFFFF;
+  TCNT1 = 0;
+#endif
+
+  somfy_rx_on[CC_INSTANCE] = 1;
+  ccRX();                               // enables the edge interrupt
+}
+
+static void somfy_rx_complete(somfy_rx_t *r) {
+  r->state = SOMFY_RX_IDLE;
+  if (somfy_rx_ready[CC_INSTANCE])      // previous frame not yet reported
+    return;
+  memcpy(somfy_rx_frame[CC_INSTANCE], r->data, SOMFY_RTS_FRAME_SIZE);
+  somfy_rx_ready[CC_INSTANCE] = 1;
+}
+
+static void somfy_rx_abort(somfy_rx_t *r, uint8_t level, uint16_t raw) {
+  somfy_rx_dbg_t *g = &somfy_rx_dbg[CC_INSTANCE];
+  if (r->state != SOMFY_RX_IDLE && (TX_REPORT & REP_BITS) && !g->ready) {
+    g->kind = 'd';
+    g->bits = r->bits;
+    g->level = level;
+    g->raw = raw;
+    g->hlen = r->hlen;
+    g->ready = 1;                       // freezes the captured pulses
+  }
+  r->state = SOMFY_RX_IDLE;
+}
+
+/*
+ * Decode one (glitch filtered) pulse.
+ * level: 1 = carrier on (as read from the pin), d: length in us
+ *
+ * Within a frame the level is not taken from the pin but from the position:
+ * after the software sync (high) low and high pulses alternate.
+ */
+static void somfy_rx_pulse(somfy_rx_t *r, uint8_t level, uint16_t d) {
+#if SOMFY_RTS_RX_CAPTURE > 0
+  somfy_rx_dbg_t *g = &somfy_rx_dbg[CC_INSTANCE];
+#endif
+  uint8_t n;
+  uint8_t swsync = level && d >= SOMFY_RX_SYNC_MIN && d <= SOMFY_RX_SYNC_MAX;
+
+  // software sync starts (or restarts) a frame, if it follows the
+  // hardware sync. Otherwise noise could start a frame.
+  if (swsync && r->hwsync >= SOMFY_RX_HWSYNC_CNT) {
+    r->state = SOMFY_RX_SYNC;
+    r->hlen = somfy_rts_interval_half;
+    r->plevel = 0;
+#if SOMFY_RTS_RX_CAPTURE > 0
+    if (!g->ready)
+      g->n = 0;
+#endif
+  } else {
+#if SOMFY_RTS_RX_CAPTURE > 0
+    // diagnostics: a sw sync without enough hw sync pulses before it is
+    // reported with the pulses before it (Yh)
+    if (swsync && r->state == SOMFY_RX_IDLE && (TX_REPORT & REP_BITS) &&
+        !g->ready) {
+      uint8_t i;
+      g->kind = 'h';
+      g->bits = r->hwsync;
+      g->level = level;
+      g->raw = d;
+      g->hlen = 0;
+      for (i = 0; i < SOMFY_RX_HIST; i++)
+        g->pulse[i] = r->hist[(r->hist_pos + i) % SOMFY_RX_HIST];
+      g->n = SOMFY_RX_HIST;
+      g->ready = 1;
+    }
+#endif
+    swsync = 0;
+  }
+
+  if (d >= SOMFY_RX_HWSYNC_MIN && d <= SOMFY_RX_HWSYNC_MAX) {
+    if (r->hwsync < 0xFF)
+      r->hwsync++;
+  } else if (d < SOMFY_RX_HWSYNC_MIN || d > SOMFY_RX_HWSYNC_GAP) {
+    r->hwsync = 0;
+  }                                     // else: hw sync pulses merged by a
+                                        // dropout, or the sw sync itself
+
+  if (r->state == SOMFY_RX_IDLE) {
+#if SOMFY_RTS_RX_CAPTURE > 0
+    r->hist[r->hist_pos] = (d >> 4) > 0xFF ? 0xFF : (d >> 4);
+    r->hist_pos = (r->hist_pos + 1) % SOMFY_RX_HIST;
+#endif
+    return;
+  }
+
+#if SOMFY_RTS_RX_CAPTURE > 0
+  if ((TX_REPORT & REP_BITS) && !g->ready && g->n < SOMFY_RTS_RX_CAPTURE)
+    g->pulse[g->n++] = (d >> 4) > 0xFF ? 0xFF : (d >> 4);
+#endif
+
+  if (swsync)                           // the sw sync itself
+    return;
+
+  level = r->plevel;
+  r->plevel ^= 1;
+
+  // Number of half symbols. The ASK demodulator delays the rising or the
+  // falling edge, so one level gets longer and the other shorter (received:
+  // up to +-1000us in the hw sync, half symbols 128-816us), varying during
+  // the frame. This cancels out in the sum of two adjacent pulses (a high
+  // and a low): it is 2, 3 or 4 half symbols, minus those of the previous
+  // pulse gives the half symbols of this pulse.
+  uint16_t h = r->hlen;
+  if (r->state == SOMFY_RX_SYNC) {
+    // the first low: the last half symbol of the sync and the first half of
+    // the first bit (always 1, key 0x8?-0xB?)
+    if (d < h + (h >> 2) || d > 3 * h + (h >> 2)) {
+      somfy_rx_abort(r, level, d);
+      return;
+    }
+    n = 2;
+  } else if (d < (h >> 1)) {
+    // much too short (carrier lost or found too early): one damaged half
+    // symbol, the missing time is in the neighbour pulse and thus still in
+    // the sum with the next pulse
+    n = 1;
+  } else {
+    uint16_t sum = r->dprev + (d > 0x7FFF ? 0x7FFF : d);
+    uint8_t ns;
+    if (sum < h + (h >> 1))
+      ns = 0;                           // too short
+    else if (sum < 2 * h + (h >> 1))
+      ns = 2;
+    else if (sum < 3 * h + (h >> 1))
+      ns = 3;
+    else if (sum < 4 * h + (h >> 1) + (h >> 2))
+      ns = 4;
+    else
+      ns = 0;                           // too long
+    if (ns <= r->nprev || ns - r->nprev > 2) {
+      somfy_rx_abort(r, level, d);
+      return;
+    }
+    n = ns - r->nprev;
+    if (r->dprev >= (h >> 1))
+      r->hlen = (7 * h + (ns == 3 ? sum / 3 : sum >> (ns >> 1))) >> 3;
+  }
+  r->dprev = d;
+  r->nprev = n;
+
+  if (r->state == SOMFY_RX_SYNC) {
+    // the first half symbol of low belongs to the sync
+    r->state = SOMFY_RX_DATA;
+    r->bits = 0;
+    r->half = SOMFY_RX_HALF_NONE;
+    n--;
+  }
+
+  while (n--) {
+    if (r->half == SOMFY_RX_HALF_NONE) {
+      r->half = level ? SOMFY_RX_HALF_HIGH : SOMFY_RX_HALF_LOW;
+      if (r->bits == SOMFY_RX_BITS-1) {
+        // last bit: its value is known from the first half, the second
+        // half may merge with the inter-frame gap
+        uint8_t *p = &r->data[SOMFY_RTS_FRAME_SIZE-1];
+        *p = (*p << 1) | (level ? 0 : 1);
+        somfy_rx_complete(r);
+        return;
+      }
+      continue;
+    }
+
+    // second half: manchester needs a transition in the middle of the bit
+    if ((r->half == SOMFY_RX_HALF_HIGH) == (level != 0)) {
+      somfy_rx_abort(r, level, d);
+      return;
+    }
+
+    uint8_t *p = &r->data[r->bits >> 3];
+    *p = (*p << 1) | (r->half == SOMFY_RX_HALF_LOW ? 1 : 0);
+    r->half = SOMFY_RX_HALF_NONE;
+    r->bits++;
+  }
+}
+
+/*
+ * Called from the edge ISR.
+ * pin:         input level read in the ISR (1 = carrier on)
+ * duration_us: time since the previous edge
+ *
+ * The level of the pulse which just ended is taken from the pin level read
+ * at the previous edge: if a spike is shorter than the interrupt latency,
+ * the pin may already be back when it is read, and the long pulse before
+ * would get the wrong level.
+ *
+ * Short spikes (< ca. 1/4 half symbol) are merged into the surrounding pulse.
+ * Therefore each pulse is held back until the next pulse has ended.
+ */
+static uint16_t somfy_rx_add(uint16_t a, uint16_t b) {
+  return (0xFFFF - a < b) ? 0xFFFF : a + b;
+}
+
+void somfy_rts_edge(uint8_t pin, uint16_t duration_us) {
+  somfy_rx_t *r = &somfy_rx[CC_INSTANCE];
+  uint8_t level = r->last_pin;
+
+  r->last_pin = pin;
+
+  // spike(s): < ca. 1/4 half symbol (dropouts of 128-165us were seen)
+  if (duration_us < (somfy_rts_interval_half >> 2) + (somfy_rts_interval_half >> 5)) {
+    if (r->hold_valid) {
+      r->glitch_dur = r->glitch ? somfy_rx_add(r->glitch_dur, duration_us)
+                                : duration_us;
+      r->glitch = 1;
+    }
+    return;
+  }
+
+  if (r->glitch) {
+    r->glitch = 0;
+    if (level == r->hold_level) {       // spike inside the held pulse
+      r->hold_dur = somfy_rx_add(r->hold_dur,
+                                 somfy_rx_add(r->glitch_dur, duration_us));
+      return;
+    }
+    // spikes at the beginning of this pulse
+    duration_us = somfy_rx_add(duration_us, r->glitch_dur);
+  }
+
+  if (r->hold_valid)
+    somfy_rx_pulse(r, r->hold_level, r->hold_dur);
+
+  r->hold_valid = 1;
+  r->hold_level = level;
+  r->hold_dur = duration_us;
+}
+
+void somfy_rts_task(void) {
+  uint8_t inst = CC_INSTANCE;
+  uint8_t f[SOMFY_RTS_FRAME_SIZE];
+  uint8_t i, cks = 0;
+
+  if (!(inst < NUM_SLOWRF))
+    return;
+
+  // no further edge (e.g. after the last frame): decode the held pulse
+  if (somfy_rx[inst].hold_valid) {
+    cli();
+    if (somfy_rx[inst].hold_valid && !somfy_rx[inst].glitch &&
+        rf_receive_edge_elapsed_us() > SOMFY_RX_FLUSH_US) {
+      somfy_rx[inst].hold_valid = 0;
+      somfy_rx_pulse(&somfy_rx[inst], somfy_rx[inst].hold_level,
+                     somfy_rx[inst].hold_dur);
+    }
+    sei();
+  }
+
+  if (somfy_rx_dbg[inst].ready == 1) {
+    somfy_rx_dbg_t *g = &somfy_rx_dbg[inst];
+    // Yd<bits> <H|L> <us> <mean half symbol>: aborted frame
+    // Yh<hw sync pulses> <H|L> <us> 0: sw sync without hw sync, the Yp line
+    // has the pulses before it (oldest first, alternating levels)
+    MULTICC_PREFIX();
+    DC('Y'); DC(g->kind);
+    DU(g->bits, 2);
+    DC(' ');
+    DC(g->level ? 'H' : 'L');
+    DU(g->raw, 6);
+    DU(g->hlen, 5);
+    DNL();
+#if SOMFY_RTS_RX_CAPTURE > 0
+    g->pos = 0;
+    g->ready = 2;
+#else
+    g->ready = 0;
+#endif
+  }
+
+#if SOMFY_RTS_RX_CAPTURE > 0
+  // Yp<pulses>: pulses since the sw sync (high first), 16us units, in
+  // lines of up to SOMFY_RX_YP_LINE pulses, each one written only when it
+  // fits into the TX buffer (the buffer drops what does not fit)
+  if (somfy_rx_dbg[inst].ready == 2 &&
+      TTY_Tx_Buffer.nbytes <= TTY_BUFSIZE - (2 * SOMFY_RX_YP_LINE + 8)) {
+    somfy_rx_dbg_t *g = &somfy_rx_dbg[inst];
+    MULTICC_PREFIX();
+    DC('Y'); DC('p');
+    for (i = 0; i < SOMFY_RX_YP_LINE && g->pos < g->n; i++)
+      DH2(g->pulse[g->pos++]);
+    DNL();
+    if (g->pos >= g->n)
+      g->ready = 0;
+  }
+#endif
+
+  if (!somfy_rx_ready[inst])
+    return;
+
+  memcpy(f, somfy_rx_frame[inst], SOMFY_RTS_FRAME_SIZE);
+  somfy_rx_ready[inst] = 0;
+
+  // "decrypt"
+  for (i = SOMFY_RTS_FRAME_SIZE-1; i > 0; i--)
+    f[i] ^= f[i-1];
+
+  // checksum: xor of all nibbles must be 0
+  for (i = 0; i < SOMFY_RTS_FRAME_SIZE; i++)
+    cks ^= f[i] ^ (f[i] >> 4);
+  // checksum ok, address not 000000/FFFFFF, rolling code not 0 (except
+  // for sensor frames, command E)
+  if ((cks & 0x0F) ||
+      (f[4] == 0x00 && f[5] == 0x00 && f[6] == 0x00) ||
+      (f[4] == 0xFF && f[5] == 0xFF && f[6] == 0xFF) ||
+      (f[2] == 0x00 && f[3] == 0x00 && (f[1] >> 4) != 0x0E)) {
+    if (TX_REPORT & REP_BITS) {         // Yc<frame>: invalid frame
+      MULTICC_PREFIX();
+      DC('Y'); DC('c');
+      for (i = 0; i < SOMFY_RTS_FRAME_SIZE; i++)
+        DH2(f[i]);
+      DNL();
+    }
+    return;
+  }
+
+  // a remote repeats the frame as long as the button is pressed
+  if (!(TX_REPORT & REP_REPEATED) &&
+      !memcmp(f, somfy_rx_last[inst], SOMFY_RTS_FRAME_SIZE) &&
+      (ticks - somfy_rx_time[inst]) < REPTIME) {
+    somfy_rx_time[inst] = ticks;
+    return;
+  }
+  memcpy(somfy_rx_last[inst], f, SOMFY_RTS_FRAME_SIZE);
+  somfy_rx_time[inst] = ticks;
+
+  LED_ON();
+  MULTICC_PREFIX();
+  DC('Y');
+  DC('s');
+  for (i = 0; i < SOMFY_RTS_FRAME_SIZE; i++)
+    DH2(f[i]);
+  if (TX_REPORT & REP_RSSI)
+    DH2(cc1100_readReg(CC1100_RSSI));
+  DNL();
+  LED_OFF();
+}
+#endif // HAS_SOMFY_RTS_RX
 
 static void send_somfy_rts_bitZero(void) {
 	// Somfy RTS bits are manchester encoded: 0 = high->low
@@ -213,7 +689,7 @@ static void send_somfy_rts_frame(somfy_rts_frame_t *frame, int8_t hwPulses) {
 	// send inter-frame gap
 	// if last bit = 0, silence is 1/2 symbol longer
 	CC1100_CLEAR_OUT;// Low
-	my_delay_us(30415 + ((frame[6] >> 7) & 1) ? 0 : somfy_rts_interval_half);
+	my_delay_us(30415 + ((frame[SOMFY_RTS_FRAME_SIZE-1] & 1) ? 0 : somfy_rts_interval_half));
 }
 
 static uint8_t somfy_rts_calc_checksum(somfy_rts_frame_t *frame) {
@@ -287,9 +763,13 @@ static void somfy_rts_send(char *in) {
 
 #ifdef USE_RF_MODE
 	change_RF_mode(RF_mode_somfy);
+#ifdef HAS_SOMFY_RTS_RX
+	somfy_rts_rx_pause();
+#endif
 #else
-	// If NOT in Somfy mode
-	if (!somfy_rts_on) {
+	uint8_t rx_was_on = SOMFY_RX_ON;
+	// If NOT in Somfy receive mode
+	if (!rx_was_on) {
 	#ifdef HAS_ASKSIN
 		if (asksin_on) {
 			somfy_restore_asksin = 1;
@@ -305,6 +785,11 @@ static void somfy_rts_send(char *in) {
 		somfy_rts_tunein();
 		my_delay_ms(3);             // 3ms: Found by trial and error
 	}
+#ifdef HAS_SOMFY_RTS_RX
+	else {
+		somfy_rts_rx_pause();
+	}
+#endif
 #endif
 	ccStrobe(CC1100_SIDLE);
 	ccStrobe(CC1100_SFRX);
@@ -327,21 +812,23 @@ static void somfy_rts_send(char *in) {
 
 #ifdef USE_RF_MODE
 	if(!restore_RF_mode()) {
-	  // enable RX again
+	  // we were already in Somfy mode: enable RX again
+#ifdef HAS_SOMFY_RTS_RX
+    somfy_rts_rx_start();
+#else
     if (TX_REPORT) {
       ccRX();
     } else {
       ccStrobe(CC1100_SIDLE);
     }
+#endif
 	}
 #else
-	if (somfy_rts_on) {
-		// enable RX again
-		if (tx_report) {
-			ccRX();
-		} else {
-			ccStrobe(CC1100_SIDLE);
-		}
+	if (rx_was_on) {
+		// enable Somfy RX again
+#ifdef HAS_SOMFY_RTS_RX
+		somfy_rts_rx_start();
+#endif
 	}
  	#ifdef HAS_ASKSIN
    	else if (somfy_restore_asksin) {
@@ -404,10 +891,45 @@ void somfy_rts_func(char *in) {
 		DC('Y');DC('t');DC(':');
 		DU(somfy_rts_interval, 6);
 		DNL();
+#ifdef HAS_SOMFY_RTS_RX
+	} else if (in[1] == 'e') {	// Enable/disable reception
+		if (in[2] == '1') {
+#ifdef USE_RF_MODE
+			if (CC_INSTANCE < NUM_SLOWRF)
+				set_RF_mode(RF_mode_somfy);
+#else
+			if (!SOMFY_RX_ON) {
+	#ifdef HAS_ASKSIN
+				if (asksin_on) {
+					somfy_restore_asksin = 1;
+					asksin_on = 0;
+				}
+	#endif
+	#ifdef HAS_MORITZ
+				if (moritz_on) {
+					somfy_restore_moritz = 1;
+					moritz_on = 0;
+				}
+	#endif
+			}
+			somfy_rts_rx_start();
+#endif
+		} else if (in[2] == '0') {
+			if (SOMFY_RX_ON)
+				somfy_rts_func("Yx");
+		}
+		MULTICC_PREFIX();
+		DC('Y');DC('e');DC(':');
+		DC(SOMFY_RX_ON ? '1' : '0');
+		DNL();
+#endif
 	} else if (in[1] == 'x') { 	// Reset Frequency back to Eeprom value
 #ifdef USE_RF_MODE
 	  set_RF_mode(RF_mode_off);
 #else
+#ifdef HAS_SOMFY_RTS_RX
+	  somfy_rts_rx_off();
+#endif
 	  if(0) { ;
 		#ifdef HAS_ASKSIN
 		} else if (somfy_restore_asksin) {
@@ -429,7 +951,6 @@ void somfy_rts_func(char *in) {
 				ccStrobe(CC1100_SIDLE);
 			}
 		}
-		somfy_rts_on = 0;
 #endif
 	}
 }

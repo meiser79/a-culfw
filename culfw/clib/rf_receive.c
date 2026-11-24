@@ -54,6 +54,9 @@
 #endif
 #include "rf_mode.h"
 #include "multi_CC.h"
+#ifdef HAS_SOMFY_RTS
+#include "somfy_rts.h"                  // for somfy_rts_edge, etc
+#endif
 
 #ifdef USE_HAL
 #include "hal.h"
@@ -139,6 +142,13 @@ set_txrestore()
     // rf_mbus.c handles cc1101 configuration on its own.
     // if mbus is activated the configuration must not be
     // changed here, that leads to a crash!
+    return;
+  }
+#endif
+
+#if defined(HAS_SOMFY_RTS_RX) && !defined(USE_RF_MODE)
+  if(somfy_rts_rx_active()) {   // Somfy reception has been enabled (Ye1)
+    somfy_rts_rx_start();
     return;
   }
 #endif
@@ -336,6 +346,13 @@ RfAnalyze_Task(void)
   uint8_t datatype = 0;
   bucket_t *b;
   uint8_t oby = 0;
+
+#if defined(HAS_SOMFY_RTS_RX) && !defined(USE_RF_MODE)
+  if(somfy_rts_rx_active()) {   // SlowRF is replaced by Somfy reception
+    somfy_rts_task();
+    return;
+  }
+#endif
 
   if(lowtime[CC_INSTANCE]) {
 #ifndef NO_RF_DEBUG
@@ -801,6 +818,25 @@ ISR(CC1100_INTVECT)
     return;
   }
 #endif
+#ifdef HAS_SOMFY_RTS_RX
+  if(somfy_rts_rx_active()) {
+    // The timer runs freely. Measure the length of the level which just
+    // ended and restart the timer.
+    uint16_t us = rf_receive_edge_elapsed_us();
+#ifdef USE_HAL
+    HAL_timer_reset_counter_value(CC_INSTANCE);
+#else
+    TCNT1 = 0;
+#endif
+#ifdef USE_HAL
+    uint8_t pin = hal_CC_Pin_Get(CC_INSTANCE,CC_Pin_In) ? 1 : 0;
+#else
+    uint8_t pin = bit_is_set(CC1100_IN_PORT,CC1100_IN_PIN) ? 1 : 0;
+#endif
+    somfy_rts_edge(pin, us);
+    return;
+  }
+#endif
 #ifdef LONG_PULSE
   #ifdef SAM7
   uint16_t c = HAL_timer_get_counter_value(CC_INSTANCE) / 6;   // catch the time and make it smaller
@@ -1241,6 +1277,23 @@ retry_sync:
   }
 
 }
+
+#ifdef HAS_SOMFY_RTS_RX
+// Time since the last edge in us (free running timer, see somfy_rts_rx_start)
+uint16_t
+rf_receive_edge_elapsed_us(void)
+{
+#ifdef SAM7
+  uint32_t t = HAL_timer_get_counter_value(CC_INSTANCE);  // 2.666us
+  t = (t * 8) / 3;
+  return (t > 0xFFFF) ? 0xFFFF : t;
+#elif defined STM32
+  return HAL_timer_get_counter_value(CC_INSTANCE);         // 1us
+#else
+  return TCNT1;                                            // 1us
+#endif
+}
+#endif
 
 uint8_t
 rf_isreceiving()

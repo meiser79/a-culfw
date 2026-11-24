@@ -69,6 +69,7 @@
 #endif
 
 #if defined(CUL_V4)
+#  define NO_SOMFY_RTS_RX               // not enough RAM (1kB) for receiving
 #  define HAS_ZWAVE                     // PROGMEM:  882
 #  define TTY_BUFSIZE           64      // RAM: TTY_BUFSIZE*4
 #endif
